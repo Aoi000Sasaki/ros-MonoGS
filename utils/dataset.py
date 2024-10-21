@@ -850,8 +850,8 @@ class UseDB(BaseDataset):
         self.database = os.path.join(self.data_dir, "bagdata.db")
         self.conn = sqlite3.connect(self.database)
         self.image_cursor = self.conn.cursor()
+        self.imu_cursor = self.conn.cursor()
         self.num_imgs = self.image_cursor.execute("SELECT COUNT(*) FROM image_data").fetchone()[0]
-
 
         color_camera_info = os.path.join(self.data_dir, "color_camera_info.yaml")
         with open(color_camera_info, "r") as f:
@@ -910,6 +910,33 @@ class UseDB(BaseDataset):
             depth = None
 
         return color, depth, pose
+
+    def calculate_imu_delta(self, prev_frame_idx, current_frame_idx):
+        prev_timestamp = self.image_cursor.execute(f"SELECT timestamp FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {prev_frame_idx}").fetchone()[0]
+        current_timestamp = self.image_cursor.execute(f"SELECT timestamp FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {current_frame_idx}").fetchone()[0]
+
+        query = f"SELECT * FROM imu_data WHERE timestamp BETWEEN {prev_timestamp} AND {current_timestamp}"
+        imu_data = self.imu_cursor.execute(query).fetchall()
+
+        # calculate rot delta
+        rot_delta = torch.zeros(3, device=self.device, dtype=self.dtype)
+
+        # calculate trans delta
+        trans_delta = torch.zeros(3, device=self.device, dtype=self.dtype)
+        prev_timestamp = None
+        for data in imu_data:
+            timestamp, _, _, _, _, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z = data
+
+            if prev_timestamp is not None:
+                dt = timestamp - prev_timestamp
+                trans_delta += torch.tensor([accel_x, -accel_y, -accel_z], device=self.device, dtype=self.dtype) * (dt * dt)
+
+                # kari
+                rot_delta += torch.tensor([gyro_x, -gyro_y, -gyro_z], device=self.device, dtype=self.dtype) * (dt * dt)
+
+            prev_timestamp = timestamp
+
+        return rot_delta, trans_delta
 
 
 def load_dataset(args, path, config):

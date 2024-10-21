@@ -130,6 +130,13 @@ class FrontEnd(mp.Process):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         viewpoint.update_RT(prev.R, prev.T)
 
+        # use tannraku
+        if self.config["Dataset"]["type"] == "use_db" and self.config["use_db"]["use_imu"]:
+            prev_frame_idx = cur_frame_idx - self.use_every_n_frames
+            imu_delta = self.dataset.calculate_imu_delta(prev_frame_idx, cur_frame_idx)
+            viewpoint.cam_rot_delta.data = imu_delta[0]
+            viewpoint.cam_trans_delta.data = imu_delta[1]
+
         opt_params = []
         opt_params.append(
             {
@@ -190,8 +197,14 @@ class FrontEnd(mp.Process):
                         else np.zeros((viewpoint.image_height, viewpoint.image_width)),
                     )
                 )
+
             if converged:
+                Log(f"frame: {cur_frame_idx}, converged at itr: {tracking_itr}")
                 break
+            if tracking_itr == self.tracking_itr_num - 1:
+                Log(f"frame: {cur_frame_idx}, did not converge")
+
+
 
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg
