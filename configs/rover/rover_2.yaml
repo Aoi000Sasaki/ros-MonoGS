@@ -17,10 +17,11 @@ Dataset:
   type: 'rover'
 
 Rover:
-  metadata: /home/user/ws/src/bag/62_2024-08-07_22-24-18/metadata.json
+  metadata: /home/user/ws/src/bag/rover_test1/2_frontview/metadata.json
   has_depth: True
   color_stream_name: 'color'
   depth_stream_name: 'depth'
+  color_data_type: 'image'
   timecode_th: 20 # ms
   value_scale: 1.0 # The value for converting depth image pixel values to actual depth values. Usually 1, but check the second column in depth_timecode.txt.
 

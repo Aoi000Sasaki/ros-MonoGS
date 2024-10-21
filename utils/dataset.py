@@ -20,6 +20,8 @@ import threading
 import rclpy
 from cv_bridge import CvBridge
 from utils.ros_utils import CameraDataSubscriber, start_node
+import yaml
+import sqlite3
 
 
 class ReplicaParser:
@@ -199,26 +201,34 @@ class RoverParser:
         color_stream_name = config["Rover"]["color_stream_name"]
         c_fps = metadata[color_stream_name]["fps"]
         current_dir = metadata["currentDir"]
-        color_video_path = current_dir + "/" + color_stream_name + metadata[color_stream_name]["containerFormat"]
-        color_video_tc_path = current_dir + "/" + color_stream_name + "_timecode.txt"
-        color_video_cap = cv2.VideoCapture(color_video_path)
-        self.color_imgs = []
+        self.color_paths = []
         self.color_imgs_tc = []
-        self.depth_imgs = []
+        self.depth_paths = []
         self.depth_imgs_tc = []
 
-        while color_video_cap.isOpened():
-            ret, frame = color_video_cap.read()
-            if not ret:
-                break
-            self.color_imgs.append(frame)
-        color_video_cap.release()
+        if config["Rover"]["color_data_type"] == "video":
+            color_video_path = current_dir + "/" + color_stream_name + metadata[color_stream_name]["containerFormat"]
+            color_video_tc_path = current_dir + "/" + color_stream_name + "_timecode.txt"
+            color_video_cap = cv2.VideoCapture(color_video_path)
+
+            while color_video_cap.isOpened():
+                ret, frame = color_video_cap.read()
+                if not ret:
+                    break
+                self.color_paths.append(frame)
+            color_video_cap.release()
+        elif config["Rover"]["color_data_type"] == "image":
+            color_imgs_dir = current_dir + "/" + color_stream_name
+            color_paths = glob.glob(f"{color_imgs_dir}/*{metadata[color_stream_name]['imageFormat']}")
+            self.color_paths = sorted(color_paths, key=lambda x: int(os.path.basename(x).split(".")[0].split("_")[0]))
+
+        color_video_tc_path = current_dir + "/" + color_stream_name + "_timecode.txt"
         with open(color_video_tc_path, "r") as f:
             f.readline()
             lines = f.readlines()
             for line in lines:
                 self.color_imgs_tc.append(float(line))
-        self.n_imgs = len(self.color_imgs)
+        self.n_imgs = len(self.color_paths)
 
         if config["Rover"]["has_depth"]:
             depth_stream_name = config["Rover"]["depth_stream_name"]
@@ -227,26 +237,26 @@ class RoverParser:
             depth_imgs_dir = current_dir + "/" + depth_stream_name
             depth_imgs_tc_path = current_dir + "/" + depth_stream_name + "_timecode.txt"
 
-            depth_imgs_path = sorted(glob.glob(f"{depth_imgs_dir}/*{metadata[depth_stream_name]['imageFormat']}"))
-            self.depth_imgs = [cv2.imread(img_path, cv2.IMREAD_UNCHANGED) for img_path in depth_imgs_path]
+            depth_paths = glob.glob(f"{depth_imgs_dir}/*{metadata[depth_stream_name]['imageFormat']}")
+            self.depth_paths = sorted(depth_paths, key=lambda x: int(os.path.basename(x).split(".")[0].split("_")[0]))
             with open(depth_imgs_tc_path, "r") as f:
                 f.readline()
                 lines = f.readlines()
                 for line in lines:
-                    self.depth_imgs_tc.append(float(line))
+                    self.depth_imgs_tc.append(float(line.split(",")[0]))
 
             timecode_th = config["Rover"]["timecode_th"]
             while True:
                 if self.color_imgs_tc[0] - self.depth_imgs_tc[0] > timecode_th:
-                    self.depth_imgs.pop(0)
+                    self.depth_paths.pop(0)
                     self.depth_imgs_tc.pop(0)
                 elif self.depth_imgs_tc[0] - self.color_imgs_tc[0] > timecode_th:
-                    self.color_imgs.pop(0)
+                    self.color_paths.pop(0)
                     self.color_imgs_tc.pop(0)
                 else:
                     break
 
-            self.n_imgs = min(len(self.color_imgs), len(self.depth_imgs))
+            self.n_imgs = min(len(self.color_paths), len(self.depth_paths))
 
 
 class BaseDataset(torch.utils.data.Dataset):
@@ -545,6 +555,7 @@ class RealsenseDataset(BaseDataset):
         )
         return image, None, pose
 
+
 class RosDepthDataset(BaseDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
@@ -611,6 +622,7 @@ class RosDepthDataset(BaseDataset):
             depth = None
         return image, depth, pose
 
+
 class RosMonoDataset(BaseDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
@@ -671,9 +683,11 @@ class RosMonoDataset(BaseDataset):
 
         return image, None, pose
 
+
 class Rover(BaseDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
+        self.config = config
         metadata_path = config["Rover"]["metadata"]
         with open(metadata_path, "r") as f:
             self.metadata = json.load(f)
@@ -683,8 +697,8 @@ class Rover(BaseDataset):
         assert self.metadata[color_stream]["isSaveVideo"]
         parser = RoverParser(config, self.metadata)
         self.num_imgs = parser.n_imgs
-        self.color_imgs = parser.color_imgs
-        self.depth_imgs = parser.depth_imgs
+        self.color_imgs = parser.color_paths
+        self.depth_imgs = parser.depth_paths
 
         self.cam_info = self.metadata[color_stream]
         self.fx = self.metadata[color_stream]["fx"]
@@ -729,12 +743,19 @@ class Rover(BaseDataset):
             self.value_scale = config["Rover"]["value_scale"]
 
     def __getitem__(self, idx):
-        color_img = self.color_imgs[idx]
+        color_img = None
         depth_img = None
         pose = torch.eye(4, device=self.device, dtype=self.dtype)
 
+        if self.config["Rover"]["color_data_type"] == "video":
+            color_img = self.color_imgs[idx]
+            color_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
+        elif self.config["Rover"]["color_data_type"] == "image":
+            color_img = cv2.imread(self.color_imgs[idx], cv2.IMREAD_COLOR)
+            color_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
+
         if self.has_depth:
-            depth_img = self.depth_imgs[idx]
+            depth_img = cv2.imread(self.depth_imgs[idx], cv2.IMREAD_UNCHANGED)
             depth_img = np.array(depth_img) / 1000.0 * self.value_scale
             if self.width_d != self.width:
                 depth_img = cv2.resize(depth_img, (self.width, self.height))
@@ -752,6 +773,145 @@ class Rover(BaseDataset):
         return color_img, depth_img, pose
 
 
+class SlamStick(BaseDataset):
+    def __init__(self, args, path, config):
+        super().__init__(args, path, config)
+        self.config = config
+        metadata_path = config["slam_stick"]["metadata"]
+        with open(metadata_path, "r") as f:
+            self.metadata = yaml.safe_load(f)
+
+        data_dir = os.path.dirname(metadata_path)
+        color_image_dir = os.path.join(data_dir, "image")
+        color_paths = glob.glob(f"{color_image_dir}/*")
+        self.color_paths = sorted(color_paths, key=lambda x: int(os.path.basename(x).split(".")[0].split("_")[0]))
+
+        self.fx = self.metadata['fx']
+        self.fy = self.metadata['fy']
+        self.cx = self.metadata['cx']
+        self.cy = self.metadata['cy']
+        self.width = self.metadata['width']
+        self.height = self.metadata['height']
+        self.w, self.h = self.width, self.height # need?
+        self.fovx = focal2fov(self.fx, self.width)
+        self.fovy = focal2fov(self.fy, self.height)
+        self.K = np.array(
+            [[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]]
+        )
+        self.disorted = True
+        self.dist_coeffs = np.array( # NOTE: maybe not correct
+            [
+                self.metadata["K"][1],
+                self.metadata["K"][2],
+                self.metadata["P"][1],
+                self.metadata["P"][2],
+                self.metadata["K"][3],
+            ]
+        )
+        self.map1x, self.map1y = cv2.initUndistortRectifyMap(
+            self.K,
+            self.dist_coeffs,
+            np.eye(3),
+            self.K,
+            (self.width, self.height),
+            cv2.CV_32FC1,
+        )
+        self.has_depth = config["slam_stick"]["has_depth"]
+
+    def __getitem__(self, idx):
+        color_path = self.color_paths[idx]
+
+        color = cv2.imread(color_path, cv2.IMREAD_COLOR)
+        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+        depth = None
+        pose = torch.eye(4, device=self.device, dtype=self.dtype)
+
+        # NOTE: why!?
+        # if self.disorted:
+        #     color = cv2.remap(color, self.map1x, self.map1y, cv2.INTER_LINEAR)
+
+        color = (
+            torch.from_numpy(color / 255.0)
+            .clamp(0.0, 1.0)
+            .permute(2, 0, 1)
+            .to(device=self.device, dtype=self.dtype)
+        )
+
+        # NOTE: ここでIMUによる推定姿勢を受け渡してもいいかも
+        return color, depth, pose
+
+
+class UseDB(BaseDataset):
+    def __init__(self, args, path, config):
+        super().__init__(args, path, config)
+        self.config = config
+        self.data_dir = config["use_db"]["data_dir"]
+
+        self.database = os.path.join(self.data_dir, "bagdata.db")
+        self.conn = sqlite3.connect(self.database)
+        self.image_cursor = self.conn.cursor()
+        self.num_imgs = self.image_cursor.execute("SELECT COUNT(*) FROM image_data").fetchone()[0]
+
+
+        color_camera_info = os.path.join(self.data_dir, "color_camera_info.yaml")
+        with open(color_camera_info, "r") as f:
+            self.color_camera_info = yaml.safe_load(f)
+
+        self.fx = self.color_camera_info["fx"]
+        self.fy = self.color_camera_info["fy"]
+        self.cx = self.color_camera_info["cx"]
+        self.cy = self.color_camera_info["cy"]
+        self.width = self.color_camera_info["width"]
+        self.height = self.color_camera_info["height"]
+        self.w, self.h = self.width, self.height
+        self.fovx = focal2fov(self.fx, self.width)
+        self.fovy = focal2fov(self.fy, self.height)
+        self.K = np.array(
+            [[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]]
+        )
+        self.disorted = True
+        self.dist_coeffs = np.array(self.color_camera_info['D'])
+        self.map1x, self.map1y = cv2.initUndistortRectifyMap(
+            self.K,
+            self.dist_coeffs,
+            np.eye(3),
+            self.K,
+            (self.width, self.height),
+            cv2.CV_32FC1,
+        )
+
+        self.has_depth = config["use_db"]["has_depth"]
+
+    def __del__(self):
+        self.conn.close()
+
+    def __getitem__(self, idx):
+        query = f"SELECT timestamp, color, depth FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {idx}"
+        self.image_cursor.execute(query)
+        timestamp, color, depth = self.image_cursor.fetchone()
+
+        pose = torch.eye(4, device=self.device, dtype=self.dtype)
+        color = cv2.imdecode(np.frombuffer(color, np.uint8), cv2.IMREAD_COLOR)
+        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+        if self.disorted:
+            color = cv2.remap(color, self.map1x, self.map1y, cv2.INTER_LINEAR)
+        color = (
+            torch.from_numpy(color / 255.0)
+            .clamp(0.0, 1.0)
+            .permute(2, 0, 1)
+            .to(device=self.device, dtype=self.dtype)
+        )
+
+        if self.has_depth:
+            depth = cv2.imdecode(np.frombuffer(depth, np.uint8), cv2.IMREAD_UNCHANGED)
+            # depth = depth / 1.0
+            depth = cv2.resize(depth, (self.width, self.height))
+        else:
+            depth = None
+
+        return color, depth, pose
+
+
 def load_dataset(args, path, config):
     if config["Dataset"]["type"] == "tum":
         return TUMDataset(args, path, config)
@@ -767,5 +927,9 @@ def load_dataset(args, path, config):
         return RosMonoDataset(args, path, config)
     elif config["Dataset"]["type"] == "rover":
         return Rover(args, path, config)
+    elif config["Dataset"]["type"] == "slam_stick":
+        return SlamStick(args, path, config)
+    elif config["Dataset"]["type"] == "use_db":
+        return UseDB(args, path, config)
     else:
         raise ValueError("Unknown dataset type")
