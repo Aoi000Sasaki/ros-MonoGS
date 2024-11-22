@@ -22,6 +22,9 @@ from cv_bridge import CvBridge
 from utils.ros_utils import CameraDataSubscriber, start_node
 import yaml
 import sqlite3
+from scipy.spatial.transform import Rotation as R
+import copy
+import math
 
 
 class ReplicaParser:
@@ -846,12 +849,15 @@ class UseDB(BaseDataset):
         super().__init__(args, path, config)
         self.config = config
         self.data_dir = config["use_db"]["data_dir"]
+        self.frame_interval = config["use_db"]["frame_interval"]
 
         self.database = os.path.join(self.data_dir, "bagdata.db")
         self.conn = sqlite3.connect(self.database)
         self.image_cursor = self.conn.cursor()
         self.imu_cursor = self.conn.cursor()
-        self.num_imgs = self.image_cursor.execute("SELECT COUNT(*) FROM image_data").fetchone()[0]
+        frame_sum = self.image_cursor.execute("SELECT COUNT(*) FROM image_data").fetchone()[0]
+        frame_sum = min(frame_sum, config["use_db"]["use_frame_limit"])
+        self.num_imgs = frame_sum // self.frame_interval
 
         color_camera_info = os.path.join(self.data_dir, "color_camera_info.yaml")
         with open(color_camera_info, "r") as f:
@@ -882,13 +888,24 @@ class UseDB(BaseDataset):
 
         self.has_depth = config["use_db"]["has_depth"]
 
+        self.prev_velocity = np.array([0.0, 0.0, 0.0])
+        self.prev_position = np.array([0.0, 0.0, 0.0])
+        self.filtered_accel = np.array([0.0, 0.0, 0.0])
+        self.gravity = np.array([0, 0, config["use_db"]["gravity_z"]])
+        self.alpha = config["use_db"]["alpha"]
+
     def __del__(self):
         self.conn.close()
 
     def __getitem__(self, idx):
-        query = f"SELECT timestamp, color, depth FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {idx}"
+        query = f"SELECT * FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {idx * self.frame_interval}"
         self.image_cursor.execute(query)
-        timestamp, color, depth = self.image_cursor.fetchone()
+
+        if self.has_depth:
+            timestamp, color, depth = self.image_cursor.fetchone()
+        else:
+            timestamp, color = self.image_cursor.fetchone()
+            depth = None
 
         pose = torch.eye(4, device=self.device, dtype=self.dtype)
         color = cv2.imdecode(np.frombuffer(color, np.uint8), cv2.IMREAD_COLOR)
@@ -912,29 +929,61 @@ class UseDB(BaseDataset):
         return color, depth, pose
 
     def calculate_imu_delta(self, prev_frame_idx, current_frame_idx):
-        prev_timestamp = self.image_cursor.execute(f"SELECT timestamp FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {prev_frame_idx}").fetchone()[0]
-        current_timestamp = self.image_cursor.execute(f"SELECT timestamp FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {current_frame_idx}").fetchone()[0]
+        prev_timestamp = self.image_cursor.execute(f"SELECT timestamp FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {prev_frame_idx * self.frame_interval}").fetchone()[0]
+        current_timestamp = self.image_cursor.execute(f"SELECT timestamp FROM image_data ORDER BY timestamp LIMIT 1 OFFSET {current_frame_idx * self.frame_interval}").fetchone()[0]
 
-        query = f"SELECT * FROM imu_data WHERE timestamp BETWEEN {prev_timestamp} AND {current_timestamp}"
+        query = f"SELECT * FROM imu_data WHERE timestamp BETWEEN {prev_timestamp} AND {current_timestamp} ORDER BY timestamp"
         imu_data = self.imu_cursor.execute(query).fetchall()
 
-        # calculate rot delta
-        rot_delta = torch.zeros(3, device=self.device, dtype=self.dtype)
-
-        # calculate trans delta
-        trans_delta = torch.zeros(3, device=self.device, dtype=self.dtype)
+        velocity = copy.deepcopy(self.prev_velocity)
+        position = copy.deepcopy(self.prev_position)
         prev_timestamp = None
+
+        if len(imu_data) == 0:
+            return torch.zeros(3, device=self.device, dtype=self.dtype), torch.zeros(3, device=self.device, dtype=self.dtype)
+
         for data in imu_data:
-            timestamp, _, _, _, _, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z = data
+            (
+                timestamp,
+                ori_x, ori_y, ori_z, ori_w,
+                accel_x, accel_y, accel_z,
+                gyro_x, gyro_y, gyro_z
+            ) = data
 
             if prev_timestamp is not None:
                 dt = timestamp - prev_timestamp
-                trans_delta += torch.tensor([accel_x, -accel_y, -accel_z], device=self.device, dtype=self.dtype) * (dt * dt)
 
-                # kari
-                rot_delta += torch.tensor([gyro_x, -gyro_y, -gyro_z], device=self.device, dtype=self.dtype) * (dt * dt)
+                q = [ori_x, ori_y, ori_z, ori_w]
+                q /= np.linalg.norm(q)
+                accel_body = np.array([accel_x, accel_y, accel_z])
+                r = R.from_quat(q)
+                accel_world = r.apply(accel_body)
+                accel_world -= self.gravity
+
+                self.filtered_accel = self.alpha * self.filtered_accel + (1 - self.alpha) * accel_world
+
+                velocity += self.filtered_accel * dt
+                position += velocity * dt / 10
 
             prev_timestamp = timestamp
+
+        trans_delta = position - self.prev_position
+        self.prev_velocity = velocity
+        self.prev_position = position
+        trans_delta = np.array([trans_delta[1], trans_delta[2], -trans_delta[0]]) # for 24
+        # trans_delta = np.array([trans_delta[2], trans_delta[1], trans_delta[0]]) # for 23
+        trans_delta = torch.tensor(trans_delta, device=self.device, dtype=self.dtype)
+
+        prev_orientation = imu_data[0][1:5]
+        current_orientation = imu_data[-1][1:5]
+        r_prev = R.from_quat(prev_orientation)
+        r_current = R.from_quat(current_orientation)
+        rot = r_current * r_prev.inv()
+        rot_euler = rot.as_euler("xyz", degrees=False)
+        rot_euler = np.array([rot_euler[1], rot_euler[2], -rot_euler[0]]) # for 24
+        # rot_euler = np.array([rot_euler[2], rot_euler[1], rot_euler[0]]) # for 23
+        rot_delta = torch.tensor(rot_euler, device=self.device, dtype=self.dtype)
+        # rot_delta = torch.zeros(3, device=self.device, dtype=self.dtype)
 
         return rot_delta, trans_delta
 

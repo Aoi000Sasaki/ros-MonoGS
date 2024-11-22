@@ -14,6 +14,9 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 
+import os
+import time
+
 
 class FrontEnd(mp.Process):
     def __init__(self, config):
@@ -42,6 +45,11 @@ class FrontEnd(mp.Process):
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
+
+        self.convergence_result_file = os.path.join(self.config["Results"]["save_dir"], "convergence.csv")
+        self.start_time = None
+        self.rot_diffs = [[], [], []]
+        self.trans_diffs = [[], [], []]
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -127,15 +135,26 @@ class FrontEnd(mp.Process):
         self.reset = False
 
     def tracking(self, cur_frame_idx, viewpoint):
+        if self.start_time is None:
+            self.start_time = time.time()
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         viewpoint.update_RT(prev.R, prev.T)
 
         # use tannraku
-        if self.config["Dataset"]["type"] == "use_db" and self.config["use_db"]["use_imu"]:
+        use_imu = self.config["Dataset"]["type"] == "use_db" and self.config["use_db"]["use_imu"]
+        if use_imu:
             prev_frame_idx = cur_frame_idx - self.use_every_n_frames
             imu_delta = self.dataset.calculate_imu_delta(prev_frame_idx, cur_frame_idx)
-            viewpoint.cam_rot_delta.data = imu_delta[0]
-            viewpoint.cam_trans_delta.data = imu_delta[1]
+            corrected_trans = imu_delta[1].clone()
+            if not self.trans_diffs[0] and self.trans_diffs[1] and self.trans_diffs[2]:
+                corrected_trans[0] *= np.mean(self.trans_diffs[0])
+                corrected_trans[1] *= np.mean(self.trans_diffs[1])
+                corrected_trans[2] *= np.mean(self.trans_diffs[2])
+
+            viewpoint.cam_rot_delta.data = imu_delta[0].clone()
+            viewpoint.cam_trans_delta.data = corrected_trans
+            trans_before = imu_delta[1].clone()
+            imu_delta[1].data.fill_(0)
 
         opt_params = []
         opt_params.append(
@@ -185,6 +204,11 @@ class FrontEnd(mp.Process):
 
             with torch.no_grad():
                 pose_optimizer.step()
+                if use_imu:
+                    imu_delta = (
+                        imu_delta[0] + viewpoint.cam_rot_delta,
+                        imu_delta[1] + viewpoint.cam_trans_delta
+                    )
                 converged = update_pose(viewpoint)
 
             if tracking_itr % 10 == 0:
@@ -198,13 +222,33 @@ class FrontEnd(mp.Process):
                     )
                 )
 
+            abs_frame = cur_frame_idx * self.config["use_db"]["frame_interval"]
+            current_time = time.time()
+            elapsed_time = current_time - self.start_time
             if converged:
-                Log(f"frame: {cur_frame_idx}, converged at itr: {tracking_itr}")
+                Log(f"frame: {cur_frame_idx}, converged at itr: {tracking_itr}, fps: {abs_frame / elapsed_time}")
                 break
             if tracking_itr == self.tracking_itr_num - 1:
                 Log(f"frame: {cur_frame_idx}, did not converge")
+                tracking_itr = -1
+                break
 
+        with open(self.convergence_result_file, "a", newline="") as f:
+            if use_imu:
+                imu_rot = imu_delta[0]
+                imu_trans = imu_delta[1]
+                f.write(f"{abs_frame}, {tracking_itr}, {abs_frame / elapsed_time}, "
+                        f"{imu_rot[0]}, {imu_rot[1]}, {imu_rot[2]}, "
+                        f"{trans_before[0]}, {trans_before[1]}, {trans_before[2]}, "
+                        f"{imu_trans[0]}, {imu_trans[1]}, {imu_trans[2]}\n")
+            else:
+                f.write(f"{abs_frame}, {tracking_itr}, {abs_frame / elapsed_time}\n")
 
+        if use_imu:
+            for i in range(3):
+                if trans_before[i].item() == 0:
+                    continue
+                self.trans_diffs[i].append(imu_delta[1][i].item() / trans_before[i].item())
 
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg
