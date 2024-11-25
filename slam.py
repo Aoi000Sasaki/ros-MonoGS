@@ -260,4 +260,5 @@ if __name__ == "__main__":
     wandb.finish()
 
     # All done
+    torch.cuda.empty_cache()
     Log("Done.")

@@ -318,6 +318,8 @@ class BackEnd(mp.Process):
         return gaussian_split
 
     def color_refinement(self):
+        if self.config["Dataset"]["type"] == "use_db" and self.config["use_db"]["skip_color_refinement"]:
+            return
         Log("Starting color refinement")
 
         iteration_total = 26000

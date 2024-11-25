@@ -226,7 +226,7 @@ class FrontEnd(mp.Process):
             current_time = time.time()
             elapsed_time = current_time - self.start_time
             if converged:
-                Log(f"frame: {cur_frame_idx}, converged at itr: {tracking_itr}, fps: {abs_frame / elapsed_time}")
+                Log(f"frame: {cur_frame_idx}, converged at itr: {tracking_itr}, fps: {(abs_frame / elapsed_time):.2f}")
                 break
             if tracking_itr == self.tracking_itr_num - 1:
                 Log(f"frame: {cur_frame_idx}, did not converge")

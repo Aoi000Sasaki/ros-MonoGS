@@ -1,0 +1,6 @@
+experiment_conditions:
+  - use_imu: true
+  - use_imu: false
+experiment_iterations:
+  - 5
+  - 5

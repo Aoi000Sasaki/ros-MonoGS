@@ -16,3 +16,8 @@ wandb
 result*
 screenshots/*
 plot_test.py
+
+compare_convergence.py
+auto_exp
+exp/
+exp/*

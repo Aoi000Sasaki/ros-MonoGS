@@ -19,11 +19,12 @@ Dataset:
 use_db:
   data_dir: /home/user/ws/src/bag/use_db/kawaisann1
   has_depth: False
-  use_imu: False
-  frame_interval: 8
+  use_imu: True
+  frame_interval: 1
   gravity_z: 9.79510588
   alpha: 0.9
-  use_frame_limit: 100000
+  use_frame_limit: 1000
+  skip_color_refinement: True
 
 Training:
   init_itr_num: 1050
